@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Locket Uploader</title>
+<style>
+  :root { --bg:#f6f4f1; --card:#fff; --fg:#1d1b19; --muted:#6b645c; --accent:#9a6b2f; --ok:#2f7a4a; --err:#b23a2b; --line:#e4ded6; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161412; --card:#211e1b; --fg:#f1ece6; --muted:#a59c92; --accent:#d4a25e; --ok:#6cc48f; --err:#ef8a7c; --line:#38322c; color-scheme: dark; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width:520px; margin:0 auto; padding:24px 16px 48px; display:grid; gap:16px; }
+  h1 { font-size:1.4rem; margin:0; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; display:grid; gap:12px; }
+  .step { font-size:.75rem; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); }
+  button { font:inherit; padding:12px 16px; border-radius:10px; border:1px solid var(--accent); background:var(--accent); color:#fff; cursor:pointer; }
+  button.secondary { background:transparent; color:var(--accent); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; }
+  progress { width:100%; height:14px; }
+  #log { font:12px/1.4 ui-monospace, Menlo, monospace; white-space:pre-wrap; color:var(--muted); max-height:180px; overflow:auto; }
+  .status { font-weight:600; }
+  .ok { color:var(--ok); } .err { color:var(--err); }
+  audio { width:100%; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Locket Uploader</h1>
+  <p class="status" id="support"></p>
+
+  <section class="card">
+    <div class="step">1 · Choose the voice</div>
+    <div class="row">
+      <button id="recBtn" class="secondary">Record</button>
+      <label><button id="pickBtn" class="secondary" type="button">Pick an audio file</button>
+        <input id="file" type="file" accept="audio/*" hidden></label>
+    </div>
+    <div id="clipInfo">No recording selected.</div>
+    <audio id="preview" controls hidden></audio>
+    <small>Audio is converted on this phone to 16 kHz mono WAV, trimmed and normalised. Nothing is uploaded to the internet.</small>
+  </section>
+
+  <section class="card">
+    <div class="step">2 · Open the locket, then connect</div>
+    <div class="row">
+      <button id="connectBtn">Connect to locket</button>
+      <button id="disconnectBtn" class="secondary" disabled>Disconnect</button>
+    </div>
+    <div id="connInfo">Not connected.</div>
+  </section>
+
+  <section class="card">
+    <div class="step">3 · Send to locket</div>
+    <div class="row">
+      <button id="sendBtn" disabled>Send voice</button>
+      <button id="playBtn" class="secondary" disabled>Play on locket</button>
+      <button id="infoBtn" class="secondary" disabled>Info</button>
+    </div>
+    <progress id="prog" value="0" max="1"></progress>
+    <div id="sendInfo"></div>
+  </section>
+
+  <div id="log"></div>
+</main>
+
+<script>
+const SERVICE = '8f1d0001-6b1c-4c8a-9d3e-5a7c2b9e4f10';
+const CTRL    = '8f1d0002-6b1c-4c8a-9d3e-5a7c2b9e4f10';
+const DATA    = '8f1d0003-6b1c-4c8a-9d3e-5a7c2b9e4f10';
+const RATE = 16000, MAX_SECONDS = 15, CHUNK = 480;
+
+const $ = id => document.getElementById(id);
+const log = m => { $('log').textContent = new Date().toLocaleTimeString() + '  ' + m + '\n' + $('log').textContent; };
+
+let wav = null, device = null, ctrl = null, data = null, waiters = [];
+
+if (!navigator.bluetooth) {
+  $('support').innerHTML = '<span class="err">This browser has no Web Bluetooth. Use Chrome on Android (or a desktop Chrome/Edge).</span>';
+} else if (!window.isSecureContext) {
+  $('support').innerHTML = '<span class="err">Open this page over https:// — Web Bluetooth only works on secure pages.</span>';
+}
+
+// ---------- Audio preparation ----------
+$('pickBtn').onclick = () => $('file').click();
+$('file').onchange = async e => { const f = e.target.files[0]; if (f) await prepare(await f.arrayBuffer(), f.name); };
+
+let recorder = null, chunks = [];
+$('recBtn').onclick = async () => {
+  if (recorder && recorder.state === 'recording') { recorder.stop(); return; }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: true } });
+    recorder = new MediaRecorder(stream); chunks = [];
+    recorder.ondataavailable = e => chunks.push(e.data);
+    recorder.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop());
+      $('recBtn').textContent = 'Record';
+      await prepare(await new Blob(chunks).arrayBuffer(), 'recording');
+    };
+    recorder.start(); $('recBtn').textContent = 'Stop recording'; log('recording…');
+  } catch (err) { log('microphone error: ' + err.message); }
+};
+
+async function prepare(buf, name) {
+  try {
+    const ctx = new AudioContext();
+    const decoded = await ctx.decodeAudioData(buf.slice(0));
+    ctx.close();
+    const seconds = Math.min(decoded.duration, MAX_SECONDS);
+    const off = new OfflineAudioContext(1, Math.ceil(seconds * RATE), RATE); // mixes to mono + resamples
+    const src = off.createBufferSource(); src.buffer = decoded; src.connect(off.destination); src.start();
+    let pcm = (await off.startRendering()).getChannelData(0);
+    pcm = trimSilence(pcm, 0.01, RATE * 0.15);
+    let peak = 0; for (const s of pcm) peak = Math.max(peak, Math.abs(s));
+    const gain = peak > 0 ? 0.89 / peak : 1; // normalise to about -1 dBFS
+    const out = new Int16Array(pcm.length);
+    for (let i = 0; i < pcm.length; i++) out[i] = Math.max(-32768, Math.min(32767, Math.round(pcm[i] * gain * 32767)));
+    wav = makeWav(out, RATE);
+    $('preview').src = URL.createObjectURL(new Blob([wav], { type: 'audio/wav' })); $('preview').hidden = false;
+    const secs = (out.length / RATE).toFixed(1);
+    $('clipInfo').textContent = `${name}: ${secs} s, ${(wav.byteLength / 1024).toFixed(0)} KB` + (decoded.duration > MAX_SECONDS ? ` (cut to ${MAX_SECONDS} s)` : '');
+    log('prepared ' + $('clipInfo').textContent);
+    refresh();
+  } catch (err) { $('clipInfo').textContent = 'Could not read that audio: ' + err.message; }
+}
+
+function trimSilence(x, thr, pad) {
+  let a = 0, b = x.length - 1;
+  while (a < b && Math.abs(x[a]) < thr) a++;
+  while (b > a && Math.abs(x[b]) < thr) b--;
+  return x.subarray(Math.max(0, a - pad), Math.min(x.length, b + pad));
+}
+
+function makeWav(samples, rate) {
+  const b = new ArrayBuffer(44 + samples.length * 2), v = new DataView(b);
+  const str = (o, s) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+  str(0, 'RIFF'); v.setUint32(4, 36 + samples.length * 2, true); str(8, 'WAVE');
+  str(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  str(36, 'data'); v.setUint32(40, samples.length * 2, true);
+  new Int16Array(b, 44).set(samples);
+  return new Uint8Array(b);
+}
+
+const CRC_TABLE = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(u8) { let c = 0xFFFFFFFF; for (let i = 0; i < u8.length; i++) c = CRC_TABLE[(c ^ u8[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+
+// ---------- Bluetooth ----------
+$('connectBtn').onclick = async () => {
+  try {
+    device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE] }] });
+    device.addEventListener('gattserverdisconnected', () => { ctrl = data = null; $('connInfo').textContent = 'Disconnected.'; refresh(); });
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(SERVICE);
+    ctrl = await svc.getCharacteristic(CTRL); data = await svc.getCharacteristic(DATA);
+    await ctrl.startNotifications();
+    ctrl.addEventListener('characteristicvaluechanged', e => {
+      const msg = new TextDecoder().decode(e.target.value); log('locket: ' + msg);
+      if (msg.startsWith('PROG ')) $('prog').value = Number(msg.slice(5));
+      waiters = waiters.filter(w => { if (w.test(msg)) { w.resolve(msg); return false; } return true; });
+    });
+    $('connInfo').textContent = 'Connected to ' + (device.name || 'locket') + '.';
+    log('connected'); refresh();
+  } catch (err) { log('connect failed: ' + err.message); }
+};
+$('disconnectBtn').onclick = () => device && device.gatt.connected && device.gatt.disconnect();
+
+function command(text, expectPrefixes, timeoutMs = 10000) {
+  return new Promise(async (resolve, reject) => {
+    const w = { test: m => expectPrefixes.some(p => m.startsWith(p)), resolve };
+    waiters.push(w);
+    setTimeout(() => { waiters = waiters.filter(x => x !== w); reject(new Error('no reply to ' + text)); }, timeoutMs);
+    try { await ctrl.writeValueWithResponse(new TextEncoder().encode(text)); } catch (e) { reject(e); }
+  });
+}
+
+$('sendBtn').onclick = async () => {
+  const btns = ['sendBtn', 'playBtn', 'infoBtn']; btns.forEach(b => $(b).disabled = true);
+  try {
+    $('prog').max = wav.byteLength; $('prog').value = 0;
+    const begin = await command('BEGIN ' + wav.byteLength, ['OK BEGIN', 'ERR']);
+    if (begin.startsWith('ERR')) throw new Error(begin === 'ERR OPEN_LOCKET_FIRST' ? 'Open the locket first, then try again.' : begin);
+    const t0 = performance.now();
+    for (let o = 0; o < wav.byteLength; o += CHUNK) {
+      await data.writeValueWithResponse(wav.subarray(o, o + CHUNK));
+      $('prog').value = Math.min(wav.byteLength, o + CHUNK);
+      if ((o / CHUNK) % 20 === 0) $('sendInfo').textContent = `Sending… ${Math.round(100 * o / wav.byteLength)} %`;
+    }
+    const end = await command('END ' + crc32(wav).toString(16), ['OK SAVED', 'ERR'], 20000);
+    if (end.startsWith('ERR')) throw new Error(end);
+    const s = ((performance.now() - t0) / 1000).toFixed(1);
+    $('sendInfo').innerHTML = `<span class="ok">Saved on the locket in ${s} s. It plays it back once to confirm.</span>`;
+  } catch (err) {
+    $('sendInfo').innerHTML = `<span class="err">${err.message}</span>`; log('send failed: ' + err.message);
+  }
+  refresh();
+};
+$('playBtn').onclick = () => command('PLAY', ['ERR'], 500).catch(() => {});
+$('infoBtn').onclick = () => command('INFO', ['INFO']).catch(e => log(e.message));
+
+function refresh() {
+  const c = !!(ctrl && device && device.gatt.connected);
+  $('connectBtn').disabled = c; $('disconnectBtn').disabled = !c;
+  $('sendBtn').disabled = !(c && wav); $('playBtn').disabled = !c; $('infoBtn').disabled = !c;
+}
+</script>
+</body>
+</html>
